@@ -1,0 +1,232 @@
+---
+title: "Daily Non Financial QC Output Log"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+# knitr::opts_chunk$set(echo = TRUE)
+
+# For running HTML/RMD
+library(knitr)
+library(rmarkdown)
+library(here)
+
+# For data cleaning
+library(tidyverse)
+library(tidylog)
+library(readxl)
+  
+library(RDCOMClient) # for emails
+
+```
+
+Below are the date ranges that are used within the SQL queries: 
+```{r data ranges used}
+LastBusDay
+Today
+
+```
+
+
+
+## Read Data Sources
+
+Starting by reading in the raw datasets  
+* In/Out Dataset for last business day  
+* Current Skill Work Item Detail (Current items in jPOD)
+* Associate List 
+
+```{r gather raw data}
+#read in the last business day's IN_OUT dataset
+setwd("S:/Relationship Management/Command Center/GGN Reports/IN_OUT Weekly Analysis/INOUT_Creation")
+
+InOut <- 
+  file.info(list.files(getwd(),pattern ="INOUT_20"), extra_cols = FALSE) %>% 
+  as.data.frame(.) %>% 
+  mutate(Date = as.Date(mtime),
+         File = row.names(.)) %>% 
+  filter(Date >= LastBusDay) %>%
+  pull(File) %>% #creates a list of CSVs to import
+  map_dfr(read_csv, .id = "source") %>%  #loops over above and appends datasets together
+  filter(trimws(toupper(TXN_TYPE)) %in% trimws(toupper(SkillList$TXN)), 
+         trimws(toupper(DESCRIPTION_X)) %in% trimws(toupper(SkillList$QUEUE))) %>% 
+  mutate(Date = as.Date(DATE, format = "%d%B%Y")) %>% 
+  filter(Date >= LastBusDay,
+         EVENT_OUT %in% c("StatusComplete"))
+  
+  
+# read in the associate list
+setwd("S:/TSR_CSR/Command Center Reporting/AssocList")
+
+Assoc <- 
+  read.csv("CurrOrg.csv", stringsAsFactors = F) %>% 
+  filter(DEPTID %in% c(10, 20, 174, 197, 173, 159, 205, 165, 176, 201))
+
+# read in the current skill work item detail (SWID)
+setwd("S:/Relationship Management/Command Center/!Raw Data")
+SWIDlist <- c("SWID 1.xls", "SWID 2.xls", "SWID 3.xls")
+
+SWID <- 
+  SWIDlist %>% 
+  map_dfr(read_excel, .id = "source") %>% 
+  filter(`Transaction ID` %in% unique(InOut$ITEM_ID),
+         Status %in% c("READY")) %>% 
+  left_join(.,
+            InOut %>% select(`Transaction ID` = ITEM_ID, CompletedID = LOGIN_NM))
+	
+  
+
+```
+
+## Clean and Orgnaize data
+
+The "Task value" table starts as a "long" dataset (many rows per one task_ID), and the function below transforms it into a wide dataset, which has one row per task id.
+
+```{r data cleaning}
+# Data Cleaning -----------------------------------------------------------
+
+QCdefault <- 
+  QC_lookup %>% 
+  filter(Level == "Default") %>% 
+  pull(QC_Perc)
+
+ExpQC <- 
+  InOut %>% 
+  group_by(LOGIN_NM, TXN_TYPE) %>% 
+  summarise(CountComp = n()) %>% 
+  full_join(.,
+            AssocList,
+            by = c("LOGIN_NM" = "LOGIN_ID", "TXN_TYPE" = "TXN")) %>%
+  mutate(QCexpec = ifelse(is.na(Override_PCT), QCdefault,  Override_PCT)) %>%
+  mutate(QClev = ceiling(CountComp * QCexpec)) %>%
+  ungroup()
+
+
+ReviewPerc <-
+  ExpQC %>% 
+  select(LOGIN_NM, TXN_TYPE, QCexpec) %>% 
+  spread(key = TXN_TYPE, value = QCexpec)
+
+
+```
+
+----
+
+### Build dataset for customer
+Starting with the raw data pulled in, and the different tables were imported and building out the different datasets that are to be sent to the team to QC.  
+
+
+```{r build output datasets}
+
+
+CurOutStand <- 
+  SWID %>% 
+  mutate(CompletedID = trimws(toupper(CompletedID))) %>% 
+  arrange(CompletedID) %>% 
+  group_by(CompletedID) %>% 
+  mutate(IncrementByID = row_number()) %>% 
+  full_join(., 
+            ExpQC %>% select(CompletedID = LOGIN_NM, TXN_TYPE, QClev) %>% mutate(CompletedID = trimws(toupper(CompletedID))),
+            by = c("CompletedID", "Transaction Type" = "TXN_TYPE")) %>% 
+  ungroup() %>% 
+  mutate(ToQC = ifelse(IncrementByID <= QClev, 1, 0))
+
+AssocNotQC <- 
+  CurOutStand %>% 
+  filter(is.na(`Transaction ID`)) %>% 
+  select(CompletedID, QClev) %>% 
+  unique() %>%
+  ungroup()
+
+
+CurOutStand %>% group_by(ToQC) %>% tally %>% spread(key = ToQC, value = n)
+
+
+QC_Report <-
+  CurOutStand %>% 
+  filter(ToQC == 1) %>% 
+  select(`Transaction ID`, `Transaction Type`, `Service Group`, `Policy LOB`, `Admin System`, CompletedID)
+
+```
+
+
+
+
+## Write out data  
+
+Writing out a statically named output for the Daily Metrics as well as excel file with the date the file was created (saved within the archive folder). 
+
+```{r write out data}
+filePath <- paste0("NonFinc_QC_Report.xlsx")
+ArchivefilePath <- paste0("NonFinc_QC_Report_", Today,".xlsx")
+RptfilePath <- paste0("NF_QC_Report.xlsx")
+
+
+list_of_df <- list(CurOutStand, AssocNotQC, ReviewPerc, InOut)
+names(list_of_df) <- c("QC_Report_All", "Assoc_WithNoItems", "Assoc_QCperc_Assigned", "InOUT_QCable")
+
+listRpt <- list(QC_Report)
+names(listRpt) <- c("QC_Report")
+
+
+writeMultTabs(fileName = here("Outputs",filePath), listObj= list_of_df)
+writeMultTabs(fileName = here("Outputs","Archive",ArchivefilePath), listObj= list_of_df)
+writeMultTabs(fileName = here("Outputs",RptfilePath), listObj= listRpt)
+
+```
+
+
+## Send completion note
+
+At the end of the process a text message is sent to the OA owner to alert them it has finished and is ready for them to review. This process could be set up to send notes to different people by day of week if the daily owners differ. Otherwise it can be managed through the import excel file.
+
+```{r send text}
+# Set up variables for who to send it to
+
+Ntfy <- Notify %>% filter(Type == "QC_Report", !is.na(Email_TO)) %>% pull(Email_TO) %>% unique()
+CC <- Notify %>% filter(Type == "QC_Report", !is.na(Email_CC)) %>% pull(Email_CC) %>% unique()
+
+emailTO <- paste(Ntfy, collapse="; ") 
+emailCC <- paste(CC, collapse="; ") 
+emailtext <- paste("Hello,
+Attached is the Non Financial QC report to work through for today.
+Please let us know if you have any questions or concerns.
+-Jeremy
+")
+
+
+# Send the email
+
+AttachedFile <- here("Outputs",RptfilePath)
+
+RptemailSubj <- paste0("NF QC Report for: ", Today)
+
+
+print(emailTO)
+sendEmailAttachCCBody(sendto = emailTO, 
+                      subject = RptemailSubj, 
+                      attchmnt = AttachedFile, 
+                      message = emailtext, 
+                      CCto = emailCC)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
